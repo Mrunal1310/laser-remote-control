@@ -1,273 +1,307 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 
 const BACKEND_URL = "https://laser-remote-control-1.onrender.com";
 
+function getWsUrl() {
+  return BACKEND_URL.replace("https://", "wss://") + "/ws";
+}
+
+function Dot({ active, color, size = 8 }) {
+  return (
+    <span style={{
+      width: size, height: size, borderRadius: "50%",
+      background: active ? color : "#1e3a5f",
+      display: "inline-block", flexShrink: 0,
+      boxShadow: active ? `0 0 10px ${color}99` : "none",
+      transition: "all 0.4s",
+    }} />
+  );
+}
+
+function Chip({ active, borderColor, bg, dotColor, label, value }) {
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 8,
+      padding: "7px 14px", borderRadius: 30,
+      border: `1px solid ${active ? borderColor : "#1e3a5f"}`,
+      background: active ? bg : "#050e1d",
+      transition: "all 0.4s",
+    }}>
+      <Dot active={active} color={dotColor} />
+      <span style={{ color: "#64748b", fontSize: 11, fontWeight: 600, letterSpacing: "0.1em" }}>
+        {label}
+      </span>
+      <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", color: active ? dotColor : "#334155" }}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
 export default function App() {
-  const [hmiIp, setHmiIp] = useState("192.168.5.158");
+  const [hmiIp,   setHmiIp]   = useState("192.168.5.158");
   const [hmiPort, setHmiPort] = useState("8050");
-  const [esp32Ip, setEsp32Ip] = useState("");
-  const [esp32Port, setEsp32Port] = useState("9000");
 
-  const [isConnected, setIsConnected] = useState(false);
-  const [isLoading, setIsLoading] = useState(false);
-  const [statusMessage, setStatusMessage] = useState("Not connected");
-  const [error, setError] = useState("");
-  const [logs, setLogs] = useState([]);
-  const [sendData, setSendData] = useState("");
-  const [lastResponse, setLastResponse] = useState("");
-  const [esp32Online, setEsp32Online] = useState(false);
+  const [esp32Online,   setEsp32Online]   = useState(false);
+  const [hmiConnected,  setHmiConnected]  = useState(false);
+  const [isLoading,     setIsLoading]     = useState(false);
+  const [statusMsg,     setStatusMsg]     = useState("ESP32 offline");
+  const [lastPing,      setLastPing]      = useState(null);
+  const [wsState,       setWsState]       = useState("connecting");
+  const [error,         setError]         = useState("");
+  const [logs,          setLogs]          = useState([]);
+  const [sendData,      setSendData]      = useState("");
+  const [lastResponse,  setLastResponse]  = useState("");
+  const [incomingHmiData, setIncomingHmiData] = useState("");
 
-  const wsRef = useRef(null);
-  const reconnectTimerRef = useRef(null);
-  const logsEndRef = useRef(null);
+  const wsRef       = useRef(null);
+  const retryRef    = useRef(null);
+  const logsEndRef  = useRef(null);
+  const esp32Ref    = useRef(false);
 
-  useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [logs]);
+  useEffect(() => { logsEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [logs]);
 
-  function addLog(message, type = "info") {
+  const addLog = useCallback((msg, type = "info") => {
     const time = new Date().toLocaleTimeString();
-    setLogs((prev) => [...prev.slice(-49), { time, message, type }]);
-  }
+    setLogs(p => [...p.slice(-199), { time, msg, type }]);
+  }, []);
 
-  function getWsUrl() {
-    if (BACKEND_URL.startsWith("https://")) {
-      return BACKEND_URL.replace("https://", "wss://") + "/ws";
-    }
-    return BACKEND_URL.replace("http://", "ws://") + "/ws";
-  }
-
-  function connectWebSocket() {
-    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+  // Live status + HMI data WebSocket
+  const connectWS = useCallback(() => {
+    if (retryRef.current) clearTimeout(retryRef.current);
+    if (wsRef.current?.readyState === WebSocket.OPEN) return;
     if (wsRef.current) wsRef.current.close();
 
+    setWsState("connecting");
     const ws = new WebSocket(getWsUrl());
     wsRef.current = ws;
 
-    ws.onopen = () => addLog("WebSocket connected to backend", "success");
+    ws.onopen = () => { setWsState("open"); addLog("Status feed connected", "success"); };
 
-    ws.onmessage = (event) => {
+    ws.onmessage = (e) => {
       try {
-        const data = JSON.parse(event.data);
-        setIsConnected(data.connected);
-        setStatusMessage(data.message || (data.connected ? "Connected" : "Not connected"));
-        // Optional: detect if ESP32 is online based on message content
-        if (data.message && data.message.includes("ESP32")) {
-          setEsp32Online(data.connected);
+        const data = JSON.parse(e.data);
+        // If it's a status update (has esp32_connected)
+        if ("esp32_connected" in data) {
+          const was = esp32Ref.current;
+          const now = data.esp32_connected === true;
+          esp32Ref.current = now;
+          setEsp32Online(now);
+          setHmiConnected(data.hmi_connected === true);
+          setStatusMsg(data.message || "");
+          if (data.last_ping) setLastPing(data.last_ping);
+          if (!was && now) addLog("✓ ESP32 came online", "success");
+          if (was && !now) addLog("ESP32 went offline", "warn");
         }
-      } catch (err) {
-        addLog("WebSocket received invalid JSON", "warn");
-      }
+        // If it's HMI data from ESP32
+        else if (data.type === "hmi_data") {
+          const incoming = data.data || "";
+          setIncomingHmiData(incoming);
+          addLog(`📩 HMI → ${incoming}`, "info");
+        }
+      } catch (err) { addLog("Status feed: bad JSON", "warn"); }
     };
 
-    ws.onerror = () => addLog("WebSocket error", "error");
-    ws.onclose = () => {
-      addLog("WebSocket disconnected. Reconnecting in 5s...", "warn");
-      reconnectTimerRef.current = setTimeout(connectWebSocket, 5000);
+    ws.onerror = () => { setWsState("closed"); addLog("Status feed error", "error"); };
+
+    ws.onclose = (e) => {
+      setWsState("closed");
+      if (e.code === 1000) return;
+      addLog("Status feed dropped — retrying in 5 s", "warn");
+      retryRef.current = setTimeout(connectWS, 5000);
     };
-  }
+  }, [addLog]);
 
   useEffect(() => {
-    connectWebSocket();
-    return () => {
-      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-      if (wsRef.current) wsRef.current.close();
-    };
+    connectWS();
+    return () => { if (retryRef.current) clearTimeout(retryRef.current); wsRef.current?.close(); };
   }, []);
 
+  // API calls
   async function handleConnect() {
-    if (!hmiIp || !hmiPort || !esp32Ip || !esp32Port) {
-      setError("Please fill in all fields before connecting.");
-      return;
-    }
-    setError("");
-    setIsLoading(true);
-    addLog(`Connecting to HMI ${hmiIp}:${hmiPort} via ESP32 ${esp32Ip}:${esp32Port}...`, "info");
-
+    if (!hmiIp || !hmiPort) { setError("Enter HMI IP and Port."); return; }
+    if (!esp32Online)        { setError("ESP32 is offline — cannot connect."); return; }
+    setError(""); setIsLoading(true);
+    addLog(`Connecting HMI ${hmiIp}:${hmiPort}…`, "info");
     try {
-      const res = await fetch(`${BACKEND_URL}/connect`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          hmi_ip: hmiIp,
-          hmi_port: parseInt(hmiPort),
-          esp32_ip: esp32Ip,
-          esp32_port: parseInt(esp32Port),
-        }),
+      const r = await fetch(`${BACKEND_URL}/connect`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hmi_ip: hmiIp, hmi_port: parseInt(hmiPort) }),
       });
-      const data = await res.json();
-      if (data.success) {
-        setIsConnected(true);
-        setStatusMessage(data.message);
-        addLog(data.message, "success");
-      } else {
-        setError(data.message);
-        addLog(`Connection failed: ${data.message}`, "error");
-      }
-    } catch (err) {
-      setError(`Cannot reach backend: ${err.message}`);
-      addLog(`Cannot reach backend: ${err.message}`, "error");
-    } finally {
-      setIsLoading(false);
-    }
+      const d = await r.json();
+      if (d.success) addLog(`HMI connected at ${hmiIp}:${hmiPort}`, "success");
+      else { setError(d.message); addLog(`Failed: ${d.message}`, "error"); }
+    } catch (e) { setError(`Backend error: ${e.message}`); addLog(`Backend error: ${e.message}`, "error"); }
+    finally { setIsLoading(false); }
   }
 
   async function handleDisconnect() {
-    setIsLoading(true);
-    addLog("Disconnecting...", "warn");
+    setIsLoading(true); addLog("Disconnecting HMI…", "warn");
     try {
-      const res = await fetch(`${BACKEND_URL}/disconnect`, { method: "POST" });
-      const data = await res.json();
-      setIsConnected(false);
-      setStatusMessage("Disconnected");
-      addLog(data.message || "Disconnected", "warn");
-    } catch (err) {
-      setError(`Disconnect error: ${err.message}`);
-      addLog(`Disconnect error: ${err.message}`, "error");
-    } finally {
-      setIsLoading(false);
-    }
+      const r = await fetch(`${BACKEND_URL}/disconnect`, { method: "POST" });
+      const d = await r.json();
+      addLog(d.message || "Disconnected", "warn");
+    } catch (e) { setError(`Disconnect error: ${e.message}`); }
+    finally { setIsLoading(false); }
   }
 
   async function handleSend() {
     if (!sendData.trim()) return;
-    if (!isConnected) {
-      setError("Connect to HMI first before sending data.");
-      return;
-    }
-    setError("");
-    addLog(`Sending: ${sendData}`, "info");
+    if (!hmiConnected) { setError("Connect to HMI first."); return; }
+    setError(""); addLog(`Sending: ${sendData}`, "info");
     try {
-      const res = await fetch(`${BACKEND_URL}/send`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
+      const r = await fetch(`${BACKEND_URL}/send`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ data: sendData }),
       });
-      const data = await res.json();
-      if (data.success) {
-        setLastResponse(JSON.stringify(data.response, null, 2));
-        addLog("Data sent successfully", "success");
-        setSendData("");
-      } else {
-        setError(data.message);
-        addLog(`Send failed: ${data.message}`, "error");
-      }
-    } catch (err) {
-      setError(`Send error: ${err.message}`);
-      addLog(`Send error: ${err.message}`, "error");
-    }
+      const d = await r.json();
+      if (d.success) {
+        setLastResponse(JSON.stringify(d.response, null, 2));
+        addLog("Sent ✓", "success"); setSendData("");
+      } else { setError(d.message); addLog(`Send failed: ${d.message}`, "error"); }
+    } catch (e) { setError(`Send error: ${e.message}`); addLog(`Send error: ${e.message}`, "error"); }
   }
 
-  const logColor = { info: "#aaa", success: "#4ade80", error: "#f87171", warn: "#fbbf24" };
+  const LC = { info: "#94a3b8", success: "#4ade80", error: "#f87171", warn: "#fbbf24" };
+  const wsDot = wsState === "open" ? "#4ade80" : wsState === "connecting" ? "#fbbf24" : "#ef4444";
+  const wsLbl = wsState === "open" ? "live" : wsState === "connecting" ? "connecting…" : "reconnecting…";
 
   return (
-    <div style={styles.page}>
-      <div style={styles.card}>
-        <div style={styles.header}>
-          <h1 style={styles.title}>Remote HMI Control</h1>
-          <p style={styles.subtitle}>Connect to onsite HMI via ESP32 gateway (WebSocket tunnel)</p>
+    <div style={s.page}>
+      <div style={s.card}>
+        <div style={s.header}>
+          <h1 style={s.title}>Remote HMI Control</h1>
+          <p style={s.subtitle}>ESP32 · ENC28J60 · Render v5.0</p>
         </div>
 
-        <div style={{ ...styles.statusBar, background: isConnected ? "#14532d" : "#1c1917" }}>
-          <span style={{ ...styles.statusDot, background: isConnected ? "#4ade80" : "#ef4444" }} />
-          <span style={{ color: isConnected ? "#4ade80" : "#ef4444", fontWeight: 600 }}>
-            {isConnected ? "CONNECTED" : "DISCONNECTED"}
+        <div style={s.bar}>
+          <Chip active={esp32Online} borderColor="#166534" bg="#052e16"
+                dotColor="#4ade80" label="ESP32" value={esp32Online ? "ACTIVE" : "OFFLINE"} />
+          <span style={{ color: "#1e3a5f", fontSize: 16 }}>→</span>
+          <Chip active={hmiConnected} borderColor="#1d4ed8" bg="#0f1f3d"
+                dotColor="#60a5fa" label="HMI" value={hmiConnected ? "CONNECTED" : "IDLE"} />
+          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#475569" }}>
+            <Dot active size={6} color={wsDot} />
+            <span>{wsLbl}</span>
+          </div>
+          <span style={{ color: "#334155", fontSize: 11, fontStyle: "italic", width: "100%", marginTop: 4 }}>
+            {statusMsg}
           </span>
-          <span style={{ color: "#9ca3af", marginLeft: 12, fontSize: 13 }}>{statusMessage}</span>
-          {esp32Online && <span style={{ color: "#60a5fa", marginLeft: "auto", fontSize: 12 }}>ESP32 Online</span>}
         </div>
+
+        {lastPing && esp32Online && (
+          <div style={s.info}>⚡ Last PING: {new Date(lastPing).toLocaleTimeString()}</div>
+        )}
+
+        {!esp32Online && (
+          <div style={s.warn}>
+            🔌 Waiting for ESP32 WebSocket on <code style={{ color: "#fbbf24" }}>/ws/esp32</code>…
+          </div>
+        )}
 
         {error && (
-          <div style={styles.errorBox}>
-            ⚠️ {error}
-            <button style={styles.clearBtn} onClick={() => setError("")}>✕</button>
+          <div style={s.err}>
+            <span>⚠ {error}</span>
+            <button style={s.x} onClick={() => setError("")}>✕</button>
           </div>
         )}
 
-        <div style={styles.section}>
-          <h2 style={styles.sectionTitle}>Connection Settings</h2>
-          <div style={styles.grid2}>
-            <label style={styles.label}>
+        {/* HMI Connection */}
+        <div style={s.box}>
+          <h2 style={s.boxTitle}>HMI Connection</h2>
+          <div style={s.grid}>
+            <label style={s.lbl}>
               HMI IP Address
-              <input style={styles.input} value={hmiIp} onChange={(e) => setHmiIp(e.target.value)} placeholder="192.168.5.158" disabled={isConnected} />
+              <input style={s.inp} value={hmiIp} onChange={e => setHmiIp(e.target.value)}
+                     disabled={hmiConnected} placeholder="192.168.x.x" />
             </label>
-            <label style={styles.label}>
+            <label style={s.lbl}>
               HMI Port
-              <input style={styles.input} value={hmiPort} onChange={(e) => setHmiPort(e.target.value)} placeholder="8050" type="number" disabled={isConnected} />
-            </label>
-            <label style={styles.label}>
-              ESP32 Public IP (for reference)
-              <input style={styles.input} value={esp32Ip} onChange={(e) => setEsp32Ip(e.target.value)} placeholder="103.45.67.89" disabled={isConnected} />
-              <span style={styles.hint}>Used only for display – ESP32 now connects outbound.</span>
-            </label>
-            <label style={styles.label}>
-              ESP32 Listen Port (legacy)
-              <input style={styles.input} value={esp32Port} onChange={(e) => setEsp32Port(e.target.value)} placeholder="9000" type="number" disabled />
-              <span style={styles.hint}>No longer needed for inbound connections.</span>
+              <input style={s.inp} value={hmiPort} onChange={e => setHmiPort(e.target.value)}
+                     type="number" disabled={hmiConnected} placeholder="8050" />
             </label>
           </div>
-          <div style={styles.buttonRow}>
-            <button style={{ ...styles.btn, background: isConnected ? "#374151" : "#2563eb", opacity: isLoading ? 0.6 : 1 }} onClick={handleConnect} disabled={isConnected || isLoading}>
-              {isLoading && !isConnected ? "Connecting..." : "🔌 Connect"}
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <button style={s.btn("#2563eb", hmiConnected || !esp32Online || isLoading)}
+                    onClick={handleConnect} disabled={hmiConnected || !esp32Online || isLoading}>
+              {isLoading && !hmiConnected ? "CONNECTING…" : "▶ CONNECT HMI"}
             </button>
-            <button style={{ ...styles.btn, background: !isConnected ? "#374151" : "#dc2626", opacity: isLoading ? 0.6 : 1 }} onClick={handleDisconnect} disabled={!isConnected || isLoading}>
-              {isLoading && isConnected ? "Disconnecting..." : "🔴 Disconnect"}
+            <button style={s.btn("#dc2626", !hmiConnected || isLoading)}
+                    onClick={handleDisconnect} disabled={!hmiConnected || isLoading}>
+              {isLoading && hmiConnected ? "DISCONNECTING…" : "■ DISCONNECT"}
             </button>
           </div>
         </div>
 
-        {isConnected && (
-          <div style={styles.section}>
-            <h2 style={styles.sectionTitle}>Send Data to HMI</h2>
-            <div style={styles.sendRow}>
-              <input style={{ ...styles.input, flex: 1 }} value={sendData} onChange={(e) => setSendData(e.target.value)} placeholder='Enter command (e.g., {"action":"read","register":1})' onKeyDown={(e) => e.key === "Enter" && handleSend()} />
-              <button style={{ ...styles.btn, background: "#16a34a", minWidth: 80 }} onClick={handleSend}>Send</button>
-            </div>
-            {lastResponse && <pre style={styles.responseBox}>{lastResponse}</pre>}
+        {/* Incoming HMI Data Display */}
+        {hmiConnected && (
+          <div style={s.box}>
+            <h2 style={s.boxTitle}>📥 Incoming from HMI</h2>
+            <pre style={s.pre}>{incomingHmiData || "— no data yet —"}</pre>
           </div>
         )}
 
-        <div style={styles.section}>
-          <h2 style={styles.sectionTitle}>Activity Log</h2>
-          <div style={styles.logBox}>
-            {logs.length === 0 && <p style={{ color: "#6b7280", margin: 0, fontSize: 13 }}>No activity yet...</p>}
-            {logs.map((log, i) => (
+        {/* Send data */}
+        {hmiConnected && (
+          <div style={s.box}>
+            <h2 style={s.boxTitle}>Send Data to HMI</h2>
+            <div style={{ display: "flex", gap: 10 }}>
+              <input style={{ ...s.inp, flex: 1 }} value={sendData}
+                     onChange={e => setSendData(e.target.value)}
+                     placeholder='{"action":"read","register":1}'
+                     onKeyDown={e => e.key === "Enter" && handleSend()} />
+              <button style={s.btn("#16a34a", false)} onClick={handleSend}>SEND</button>
+            </div>
+            {lastResponse && <pre style={s.pre}>{lastResponse}</pre>}
+          </div>
+        )}
+
+        {/* Log */}
+        <div style={s.box}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <h2 style={{ ...s.boxTitle, marginBottom: 0 }}>Activity Log</h2>
+            {logs.length > 0 && (
+              <button style={{ ...s.x, fontSize: 11, color: "#334155" }} onClick={() => setLogs([])}>CLEAR</button>
+            )}
+          </div>
+          <div style={s.log}>
+            {!logs.length && <p style={{ color: "#1e3a5f", margin: 0, fontSize: 12 }}>No activity yet…</p>}
+            {logs.map((l, i) => (
               <div key={i} style={{ marginBottom: 4 }}>
-                <span style={{ color: "#6b7280", fontSize: 12 }}>[{log.time}] </span>
-                <span style={{ color: logColor[log.type] || "#aaa", fontSize: 13 }}>{log.message}</span>
+                <span style={{ color: "#1e3a5f", fontSize: 10 }}>[{l.time}] </span>
+                <span style={{ color: LC[l.type] || "#94a3b8", fontSize: 12 }}>{l.msg}</span>
               </div>
             ))}
             <div ref={logsEndRef} />
           </div>
         </div>
 
-        <p style={{ color: "#4b5563", fontSize: 12, textAlign: "center", marginTop: 8 }}>
-          Backend: <code style={{ color: "#60a5fa" }}>{BACKEND_URL}</code>
+        <p style={{ color: "#1e3a5f", fontSize: 11, textAlign: "center", marginTop: 8, letterSpacing: "0.04em" }}>
+          BACKEND <code style={{ color: "#2563eb" }}>{BACKEND_URL}</code>
+          &nbsp;·&nbsp; ESP32 WS <code style={{ color: "#2563eb" }}>/ws/esp32</code>
         </p>
       </div>
     </div>
   );
 }
 
-const styles = {
-  page: { minHeight: "100vh", background: "#030712", display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "24px 16px", fontFamily: "'Inter', system-ui, sans-serif" },
-  card: { background: "#111827", border: "1px solid #1f2937", borderRadius: 16, padding: 32, width: "100%", maxWidth: 760, boxSizing: "border-box" },
-  header: { marginBottom: 24, textAlign: "center" },
-  title: { color: "#f9fafb", fontSize: 26, fontWeight: 700, margin: "0 0 6px" },
-  subtitle: { color: "#9ca3af", fontSize: 14, margin: 0 },
-  statusBar: { display: "flex", alignItems: "center", gap: 8, padding: "12px 16px", borderRadius: 10, marginBottom: 20, border: "1px solid #1f2937" },
-  statusDot: { width: 10, height: 10, borderRadius: "50%", display: "inline-block", flexShrink: 0 },
-  errorBox: { background: "#450a0a", border: "1px solid #991b1b", color: "#fca5a5", padding: "10px 14px", borderRadius: 8, marginBottom: 16, fontSize: 14, display: "flex", justifyContent: "space-between", alignItems: "center" },
-  clearBtn: { background: "transparent", border: "none", color: "#fca5a5", cursor: "pointer", fontSize: 16, padding: 0 },
-  section: { background: "#1f2937", borderRadius: 10, padding: 20, marginBottom: 16, border: "1px solid #374151" },
-  sectionTitle: { color: "#e5e7eb", fontSize: 16, fontWeight: 600, margin: "0 0 16px" },
-  grid2: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16, marginBottom: 16 },
-  label: { color: "#d1d5db", fontSize: 14, display: "flex", flexDirection: "column", gap: 6 },
-  input: { background: "#111827", border: "1px solid #374151", borderRadius: 8, color: "#f9fafb", padding: "10px 12px", fontSize: 14, outline: "none", width: "100%", boxSizing: "border-box" },
-  hint: { color: "#6b7280", fontSize: 12, marginTop: 2 },
-  buttonRow: { display: "flex", gap: 12, flexWrap: "wrap" },
-  btn: { color: "#fff", border: "none", borderRadius: 8, padding: "12px 24px", fontSize: 15, fontWeight: 600, cursor: "pointer", transition: "opacity 0.2s" },
-  sendRow: { display: "flex", gap: 10, alignItems: "center" },
-  responseBox: { background: "#0f172a", color: "#34d399", borderRadius: 8, padding: 12, fontSize: 13, marginTop: 12, overflowX: "auto", border: "1px solid #1e3a5f" },
-  logBox: { background: "#0f172a", borderRadius: 8, padding: 14, height: 180, overflowY: "auto", border: "1px solid #1f2937", fontFamily: "monospace" },
+const s = {
+  page: { minHeight: "100vh", background: "#020817", display: "flex", justifyContent: "center", padding: "24px 16px", fontFamily: "'JetBrains Mono','Fira Code',monospace" },
+  card: { background: "#0a1628", border: "1px solid #1e3a5f", borderRadius: 20, padding: "32px 28px", width: "100%", maxWidth: 820, boxShadow: "0 0 60px rgba(37,99,235,0.08)", boxSizing: "border-box" },
+  header: { marginBottom: 28, textAlign: "center" },
+  title: { color: "#f0f9ff", fontSize: 24, fontWeight: 700, margin: 0, letterSpacing: "-0.02em" },
+  subtitle: { color: "#38bdf8", fontSize: 12, marginTop: 6, letterSpacing: "0.12em", textTransform: "uppercase" },
+  bar: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", padding: "14px 18px", borderRadius: 12, marginBottom: 16, background: "#050e1d", border: "1px solid #0f2744" },
+  info: { background: "#0d1f38", border: "1px solid #1e3a5f", color: "#38bdf8", padding: "10px 14px", borderRadius: 10, marginBottom: 14, fontSize: 12 },
+  warn: { background: "#1c1400", border: "1px solid #713f12", color: "#fbbf24", padding: "10px 14px", borderRadius: 10, marginBottom: 14, fontSize: 12, lineHeight: 1.7 },
+  err:  { background: "#300808", border: "1px solid #7f1d1d", color: "#fca5a5", padding: "10px 14px", borderRadius: 10, marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 12 },
+  x:    { background: "transparent", border: "none", color: "#fca5a5", cursor: "pointer", fontSize: 14 },
+  box:  { background: "#0d1f38", borderRadius: 14, padding: "20px 22px", marginBottom: 16, border: "1px solid #1e3a5f" },
+  boxTitle: { color: "#7dd3fc", fontSize: 12, fontWeight: 700, marginBottom: 16, letterSpacing: "0.12em", textTransform: "uppercase" },
+  grid: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 14, marginBottom: 16 },
+  lbl:  { color: "#475569", fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", display: "flex", flexDirection: "column", gap: 6 },
+  inp:  { background: "#050e1d", border: "1px solid #1e3a5f", borderRadius: 8, color: "#e0f2fe", padding: "10px 12px", fontSize: 13, outline: "none", fontFamily: "inherit", boxSizing: "border-box", width: "100%" },
+  btn:  (color, dis) => ({ background: dis ? "#0d1f38" : color, color: dis ? "#334155" : "#fff", border: `1px solid ${dis ? "#1e3a5f" : color}`, borderRadius: 8, padding: "11px 22px", fontSize: 12, fontWeight: 700, letterSpacing: "0.06em", cursor: dis ? "not-allowed" : "pointer", transition: "all 0.2s", fontFamily: "inherit" }),
+  pre:  { background: "#020c1b", color: "#34d399", borderRadius: 8, padding: 14, fontSize: 12, marginTop: 12, overflowX: "auto", border: "1px solid #0d4a2a", fontFamily: "inherit" },
+  log:  { background: "#020c1b", borderRadius: 10, padding: "14px 16px", height: 220, overflowY: "auto", border: "1px solid #0f2744", fontFamily: "inherit" },
 };
