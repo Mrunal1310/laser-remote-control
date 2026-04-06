@@ -4,13 +4,14 @@ from pydantic import BaseModel
 import asyncio
 import json
 import logging
+import uvicorn
 from typing import Optional
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("HMI-GATEWAY")
 
-app = FastAPI(title="Remote HMI Gateway", version="4.0.0")
+app = FastAPI(title="Remote HMI Gateway", version="4.2.0")
 
 # ================= CORS =================
 app.add_middleware(
@@ -47,7 +48,7 @@ class SendDataRequest(BaseModel):
 
 # ==========================================================
 #  ESP32 WebSocket  →  /ws/esp32
-#  ESP32 connects HERE using plain WS (ws://) port 80
+#  ESP32 connects here using WSS (TLS) port 443 via Render
 # ==========================================================
 @app.websocket("/ws/esp32")
 async def esp32_ws(websocket: WebSocket):
@@ -57,17 +58,17 @@ async def esp32_ws(websocket: WebSocket):
     esp32_websocket = websocket
     connection_status["esp32_connected"] = True
     connection_status["message"]         = "ESP32 online"
-    logger.info("✓ ESP32 WebSocket connected")
+    logger.info("✓ ESP32 WebSocket connected from %s", websocket.client)
 
     try:
         while True:
             raw = await websocket.receive_text()
-            logger.info(f"[ESP32→SERVER] {raw}")
+            logger.info("[ESP32→SERVER] %s", raw)
 
             try:
                 data = json.loads(raw)
             except Exception:
-                logger.warning("Invalid JSON from ESP32 — ignored")
+                logger.warning("Invalid JSON from ESP32 — ignored: %s", raw)
                 continue
 
             # PING → PONG
@@ -80,6 +81,12 @@ async def esp32_ws(websocket: WebSocket):
                 logger.info("[PING] → PONG sent")
                 continue
 
+            # HELLO message from ESP32 on connect
+            if data.get("status") == "HELLO":
+                logger.info("[HELLO] device=%s fw=%s version=%s",
+                            data.get("device"), data.get("fw"), data.get("version"))
+                continue
+
             # Resolve pending REST request
             req_id = data.get("request_id")
             if req_id and req_id in pending_requests:
@@ -87,7 +94,7 @@ async def esp32_ws(websocket: WebSocket):
                 if not future.done():
                     future.set_result(data)
             else:
-                logger.info(f"[ESP32] Unsolicited msg: {data}")
+                logger.info("[ESP32] Unsolicited msg: %s", data)
 
     except WebSocketDisconnect:
         logger.warning("ESP32 disconnected!")
@@ -98,7 +105,15 @@ async def esp32_ws(websocket: WebSocket):
             "hmi_ip":          None,
             "hmi_port":        None,
             "connected_at":    None,
+            "last_ping":       None,
             "message":         "ESP32 offline",
+        })
+    except Exception as e:
+        logger.error("ESP32 WS error: %s", e)
+        esp32_websocket = None
+        connection_status.update({
+            "esp32_connected": False,
+            "message":         f"Error: {e}",
         })
 
 
@@ -136,7 +151,11 @@ async def send_to_esp32(cmd: dict, timeout: float = 15.0):
 # ==========================================================
 @app.get("/")
 async def root():
-    return {"status": "HMI Gateway is running", "version": "4.0.0"}
+    return {
+        "status":  "HMI Gateway is running",
+        "version": "4.2.0",
+        "esp32":   connection_status["esp32_connected"],
+    }
 
 
 @app.get("/status")
@@ -200,12 +219,12 @@ async def send(req: SendDataRequest):
 
 # ==========================================================
 #  Frontend live-status WebSocket  →  /ws
-#  Browser connects here (wss://) to get live status every 2s
+#  Browser connects here (wss://) to get live status every 2 s
 # ==========================================================
 @app.websocket("/ws")
 async def frontend_ws(websocket: WebSocket):
     await websocket.accept()
-    logger.info("Frontend WS client connected")
+    logger.info("Frontend WS client connected from %s", websocket.client)
     try:
         while True:
             await websocket.send_json(connection_status)
@@ -219,9 +238,24 @@ async def frontend_ws(websocket: WebSocket):
 # ==========================================================
 @app.on_event("startup")
 async def startup_event():
-    logger.info("=== HMI Gateway v4.0.0 — waiting for ESP32 ===")
+    logger.info("=== HMI Gateway v4.2.0 — waiting for ESP32 ===")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     if esp32_websocket:
         await esp32_websocket.close()
+
+
+# ==========================================================
+#  Entry point
+#  CRITICAL for Render: must bind 0.0.0.0 on port 10000
+#  Render's start command should be:
+#    uvicorn main:app --host 0.0.0.0 --port 10000
+# ==========================================================
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",   # bind all interfaces — required by Render
+        port=10000,        # Render internal port
+        log_level="info",
+    )
