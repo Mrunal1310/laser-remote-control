@@ -11,7 +11,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("HMI-GATEWAY")
 
-app = FastAPI(title="Remote HMI Gateway", version="4.2.0")
+app = FastAPI(title="Remote HMI Gateway", version="4.3.0")
 
 # ================= CORS =================
 app.add_middleware(
@@ -48,7 +48,6 @@ class SendDataRequest(BaseModel):
 
 # ==========================================================
 #  ESP32 WebSocket  →  /ws/esp32
-#  ESP32 connects here using WSS (TLS) port 443 via Render
 # ==========================================================
 @app.websocket("/ws/esp32")
 async def esp32_ws(websocket: WebSocket):
@@ -83,8 +82,8 @@ async def esp32_ws(websocket: WebSocket):
 
             # HELLO message from ESP32 on connect
             if data.get("status") == "HELLO":
-                logger.info("[HELLO] device=%s fw=%s version=%s",
-                            data.get("device"), data.get("fw"), data.get("version"))
+                logger.info("[HELLO] device=%s fw=%s version=%s apn=%s",
+                            data.get("device"), data.get("fw"), data.get("version"), data.get("apn"))
                 continue
 
             # Resolve pending REST request
@@ -153,15 +152,13 @@ async def send_to_esp32(cmd: dict, timeout: float = 15.0):
 async def root():
     return {
         "status":  "HMI Gateway is running",
-        "version": "4.2.0",
+        "version": "4.3.0",
         "esp32":   connection_status["esp32_connected"],
     }
-
 
 @app.get("/status")
 async def get_status():
     return connection_status
-
 
 @app.post("/connect")
 async def connect(req: ConnectRequest):
@@ -189,7 +186,6 @@ async def connect(req: ConnectRequest):
         return {"success": False, "message": result["response"].get("error", "ESP32 error")}
     return result
 
-
 @app.post("/disconnect")
 async def disconnect():
     global connection_status
@@ -205,21 +201,33 @@ async def disconnect():
             "message":       "ESP32 online",
         })
         return {"success": True, "message": "HMI disconnected"}
-
     return {"success": False, "message": result.get("message", "Disconnect failed")}
 
+@app.post("/start")
+async def start():
+    """Send START command to HMI via ESP32."""
+    if not connection_status["hmi_connected"]:
+        return {"success": False, "message": "HMI not connected"}
+    result = await send_to_esp32({"cmd": "START"}, timeout=15.0)
+    return result
+
+@app.post("/stop")
+async def stop():
+    """Send STOP command to HMI via ESP32."""
+    if not connection_status["hmi_connected"]:
+        return {"success": False, "message": "HMI not connected"}
+    result = await send_to_esp32({"cmd": "STOP"}, timeout=15.0)
+    return result
 
 @app.post("/send")
 async def send(req: SendDataRequest):
     if not connection_status["hmi_connected"]:
         return {"success": False, "message": "HMI not connected"}
-
     return await send_to_esp32({"cmd": "SEND", "data": req.data}, timeout=15.0)
 
 
 # ==========================================================
 #  Frontend live-status WebSocket  →  /ws
-#  Browser connects here (wss://) to get live status every 2 s
 # ==========================================================
 @app.websocket("/ws")
 async def frontend_ws(websocket: WebSocket):
@@ -238,24 +246,17 @@ async def frontend_ws(websocket: WebSocket):
 # ==========================================================
 @app.on_event("startup")
 async def startup_event():
-    logger.info("=== HMI Gateway v4.2.0 — waiting for ESP32 ===")
+    logger.info("=== HMI Gateway v4.3.0 — waiting for ESP32 ===")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     if esp32_websocket:
         await esp32_websocket.close()
 
-
-# ==========================================================
-#  Entry point
-#  CRITICAL for Render: must bind 0.0.0.0 on port 10000
-#  Render's start command should be:
-#    uvicorn main:app --host 0.0.0.0 --port 10000
-# ==========================================================
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",   # bind all interfaces — required by Render
-        port=10000,        # Render internal port
+        host="0.0.0.0",
+        port=10000,
         log_level="info",
     )
