@@ -169,7 +169,6 @@ async def set_hmi_target(req: SetTargetRequest):
         "hmi_port": req.hmi_port
     }, timeout=10.0)
     if result["success"]:
-        # Optionally update status display
         connection_status["hmi_target_ip"] = req.hmi_ip
         connection_status["hmi_target_port"] = req.hmi_port
     return result
