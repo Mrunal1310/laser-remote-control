@@ -4,269 +4,208 @@ from pydantic import BaseModel
 import asyncio
 import json
 import logging
-import uvicorn
-from typing import Optional
+from typing import Optional, Dict
 from datetime import datetime
+import uuid
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("HMI-GATEWAY")
+logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Remote HMI Gateway", version="4.4.0")
+app = FastAPI(title="Remote HMI Gateway", version="2.0.0")
 
-# CORS
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "https://laser-remote-control-1.onrender.com",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global state
-esp32_websocket: Optional[WebSocket] = None
-pending_requests: dict = {}
-request_counter: int = 0
+# Store connected clients
+class ConnectionManager:
+    def __init__(self):
+        self.frontend_ws: Optional[WebSocket] = None
+        self.device_ws: Optional[WebSocket] = None
+        self.device_ready = False
+        self.pending_commands: Dict[str, asyncio.Future] = {}
 
-connection_status = {
-    "esp32_connected": False,
-    "hmi_connected":   False,
-    "hmi_ip":          None,
-    "hmi_port":        None,
-    "connected_at":    None,
-    "last_ping":       None,
-    "message":         "ESP32 offline",
-}
+    async def connect_frontend(self, websocket: WebSocket):
+        await websocket.accept()
+        self.frontend_ws = websocket
+        logger.info("Frontend WebSocket connected")
 
-# Models
+    async def connect_device(self, websocket: WebSocket):
+        await websocket.accept()
+        self.device_ws = websocket
+        self.device_ready = True
+        logger.info("Device WebSocket connected")
+        # Send initial status request to device
+        await self.send_to_device({"type": "ping"})
+
+    def disconnect_frontend(self):
+        self.frontend_ws = None
+        logger.info("Frontend WebSocket disconnected")
+
+    def disconnect_device(self):
+        self.device_ws = None
+        self.device_ready = False
+        logger.info("Device WebSocket disconnected")
+
+    async def send_to_frontend(self, message: dict):
+        if self.frontend_ws:
+            try:
+                await self.frontend_ws.send_json(message)
+            except:
+                self.disconnect_frontend()
+
+    async def send_to_device(self, message: dict):
+        if self.device_ws and self.device_ready:
+            try:
+                await self.device_ws.send_json(message)
+                return True
+            except:
+                self.disconnect_device()
+                return False
+        return False
+
+    async def send_command_and_wait(self, command: dict, timeout: float = 10.0) -> dict:
+        """Send a command to device and wait for response."""
+        cmd_id = str(uuid.uuid4())
+        command["id"] = cmd_id
+        future = asyncio.get_event_loop().create_future()
+        self.pending_commands[cmd_id] = future
+        try:
+            sent = await self.send_to_device(command)
+            if not sent:
+                raise Exception("Device not connected")
+            result = await asyncio.wait_for(future, timeout)
+            return result
+        finally:
+            self.pending_commands.pop(cmd_id, None)
+
+    def resolve_command(self, cmd_id: str, response: dict):
+        if cmd_id in self.pending_commands:
+            self.pending_commands[cmd_id].set_result(response)
+
+manager = ConnectionManager()
+
+# --- HTTP endpoints for frontend ---
 class ConnectRequest(BaseModel):
-    hmi_ip:   str
-    hmi_port: int
-
-class SetTargetRequest(BaseModel):
-    hmi_ip:   str
+    hmi_ip: str
     hmi_port: int
 
 class SendDataRequest(BaseModel):
     data: str
 
-# ------------------------------------------------------------
-# ESP32 WebSocket
-# ------------------------------------------------------------
-@app.websocket("/ws/esp32")
-async def esp32_ws(websocket: WebSocket):
-    global esp32_websocket, connection_status
-
-    await websocket.accept()
-    esp32_websocket = websocket
-    connection_status["esp32_connected"] = True
-    connection_status["message"] = "ESP32 online"
-    logger.info("✓ ESP32 WebSocket connected from %s", websocket.client)
-
+@app.post("/connect")
+async def connect_hmi(req: ConnectRequest):
+    if not manager.device_ready:
+        return {"success": False, "message": "ESP32 device not connected via WebSocket"}
     try:
-        while True:
-            raw = await websocket.receive_text()
-            logger.info("[ESP32→SERVER] %s", raw)
-
-            try:
-                data = json.loads(raw)
-            except Exception:
-                logger.warning("Invalid JSON from ESP32 — ignored: %s", raw)
-                continue
-
-            if data.get("type") == "PING":
-                connection_status["last_ping"] = datetime.now().isoformat()
-                await websocket.send_text(json.dumps({
-                    "type": "PONG",
-                    "ts":   connection_status["last_ping"]
-                }))
-                logger.info("[PING] → PONG sent")
-                continue
-
-            if data.get("status") == "HELLO":
-                logger.info("[HELLO] device=%s fw=%s version=%s",
-                            data.get("device"), data.get("fw"), data.get("version"))
-                continue
-
-            req_id = data.get("request_id")
-            if req_id and req_id in pending_requests:
-                future = pending_requests.pop(req_id)
-                if not future.done():
-                    future.set_result(data)
-            else:
-                logger.info("[ESP32] Unsolicited msg: %s", data)
-
-    except WebSocketDisconnect:
-        logger.warning("ESP32 disconnected!")
-        esp32_websocket = None
-        connection_status.update({
-            "esp32_connected": False,
-            "hmi_connected":   False,
-            "hmi_ip":          None,
-            "hmi_port":        None,
-            "connected_at":    None,
-            "last_ping":       None,
-            "message":         "ESP32 offline",
+        result = await manager.send_command_and_wait({
+            "type": "connect",
+            "hmi_ip": req.hmi_ip,
+            "hmi_port": req.hmi_port
         })
+        return {"success": result.get("success", False), "message": result.get("message", ""), "response": result}
     except Exception as e:
-        logger.error("ESP32 WS error: %s", e)
-        esp32_websocket = None
-        connection_status.update({
-            "esp32_connected": False,
-            "message":         f"Error: {e}",
-        })
-
-# ------------------------------------------------------------
-# Helper: send command to ESP32 and await response
-# ------------------------------------------------------------
-async def send_to_esp32(cmd: dict, timeout: float = 15.0):
-    global request_counter
-
-    if esp32_websocket is None:
-        return {"success": False, "message": "ESP32 not connected"}
-
-    request_counter += 1
-    req_id = str(request_counter)
-    cmd["request_id"] = req_id
-
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
-    pending_requests[req_id] = future
-
-    try:
-        await esp32_websocket.send_text(json.dumps(cmd))
-        response = await asyncio.wait_for(future, timeout=timeout)
-        return {"success": True, "response": response}
-    except asyncio.TimeoutError:
-        pending_requests.pop(req_id, None)
-        return {"success": False, "message": "Timeout waiting for ESP32 response"}
-    except Exception as e:
-        pending_requests.pop(req_id, None)
         return {"success": False, "message": str(e)}
 
-# ------------------------------------------------------------
-# REST API
-# ------------------------------------------------------------
-@app.get("/")
-async def root():
-    return {
-        "status":  "HMI Gateway is running",
-        "version": "4.4.0",
-        "esp32":   connection_status["esp32_connected"],
-    }
-
-@app.get("/status")
-async def get_status():
-    return connection_status
-
-@app.post("/set_hmi_target")
-async def set_hmi_target(req: SetTargetRequest):
-    """Change the HMI target IP/port on the ESP32 (no connection attempt)."""
-    if not connection_status["esp32_connected"]:
-        return {"success": False, "message": "ESP32 not connected"}
-    result = await send_to_esp32({
-        "cmd": "SET_HMI_TARGET",
-        "hmi_ip": req.hmi_ip,
-        "hmi_port": req.hmi_port
-    }, timeout=10.0)
-    if result["success"]:
-        # Optionally update status display
-        connection_status["hmi_target_ip"] = req.hmi_ip
-        connection_status["hmi_target_port"] = req.hmi_port
-    return result
-
-@app.post("/connect")
-async def connect(req: ConnectRequest):
-    global connection_status
-
-    if not connection_status["esp32_connected"]:
-        return {"success": False, "message": "ESP32 not connected"}
-
-    result = await send_to_esp32(
-        {"cmd": "CONNECT", "hmi_ip": req.hmi_ip, "hmi_port": req.hmi_port},
-        timeout=20.0
-    )
-
-    if result["success"] and result["response"].get("status") == "OK":
-        connection_status.update({
-            "hmi_connected": True,
-            "hmi_ip":        req.hmi_ip,
-            "hmi_port":      req.hmi_port,
-            "connected_at":  datetime.now().isoformat(),
-            "message":       f"HMI connected {req.hmi_ip}:{req.hmi_port}",
-        })
-        return {"success": True, "status": connection_status}
-
-    if result["success"]:
-        return {"success": False, "message": result["response"].get("error", "ESP32 error")}
-    return result
-
 @app.post("/disconnect")
-async def disconnect():
-    global connection_status
-
-    result = await send_to_esp32({"cmd": "DISCONNECT"}, timeout=10.0)
-
-    if result["success"] and result["response"].get("status") == "OK":
-        connection_status.update({
-            "hmi_connected": False,
-            "hmi_ip":        None,
-            "hmi_port":      None,
-            "connected_at":  None,
-            "message":       "ESP32 online",
-        })
-        return {"success": True, "message": "HMI disconnected"}
-    return {"success": False, "message": result.get("message", "Disconnect failed")}
+async def disconnect_hmi():
+    if not manager.device_ready:
+        return {"success": False, "message": "Device not connected"}
+    try:
+        result = await manager.send_command_and_wait({"type": "disconnect"})
+        return {"success": result.get("success", False), "message": result.get("message", "")}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 
 @app.post("/start")
 async def start():
-    if not connection_status["hmi_connected"]:
-        return {"success": False, "message": "HMI not connected"}
-    result = await send_to_esp32({"cmd": "START"}, timeout=15.0)
-    return result
+    if not manager.device_ready:
+        return {"success": False, "message": "Device not connected"}
+    try:
+        result = await manager.send_command_and_wait({"type": "start"})
+        return {"success": result.get("success", False), "response": result.get("response")}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 
 @app.post("/stop")
 async def stop():
-    if not connection_status["hmi_connected"]:
-        return {"success": False, "message": "HMI not connected"}
-    result = await send_to_esp32({"cmd": "STOP"}, timeout=15.0)
-    return result
+    if not manager.device_ready:
+        return {"success": False, "message": "Device not connected"}
+    try:
+        result = await manager.send_command_and_wait({"type": "stop"})
+        return {"success": result.get("success", False), "response": result.get("response")}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 
 @app.post("/send")
-async def send(req: SendDataRequest):
-    if not connection_status["hmi_connected"]:
-        return {"success": False, "message": "HMI not connected"}
-    return await send_to_esp32({"cmd": "SEND", "data": req.data}, timeout=15.0)
+async def send_data(req: SendDataRequest):
+    if not manager.device_ready:
+        return {"success": False, "message": "Device not connected"}
+    try:
+        result = await manager.send_command_and_wait({"type": "send", "data": req.data})
+        return {"success": result.get("success", False), "response": result.get("response")}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 
-# ------------------------------------------------------------
-# Frontend live‑status WebSocket
-# ------------------------------------------------------------
-@app.websocket("/ws")
-async def frontend_ws(websocket: WebSocket):
-    await websocket.accept()
-    logger.info("Frontend WS client connected from %s", websocket.client)
+@app.get("/status")
+async def get_status():
+    # Return current known status (can be extended)
+    return {"device_online": manager.device_ready}
+
+# --- WebSocket endpoints ---
+@app.websocket("/ws/frontend")
+async def websocket_frontend(websocket: WebSocket):
+    await manager.connect_frontend(websocket)
     try:
         while True:
-            await websocket.send_json(connection_status)
-            await asyncio.sleep(2)
+            # Keep connection alive, optionally receive pings from frontend
+            data = await websocket.receive_text()
+            # Frontend may send heartbeat
+            if data == "ping":
+                await websocket.send_text("pong")
     except WebSocketDisconnect:
-        logger.info("Frontend WS client disconnected")
+        manager.disconnect_frontend()
 
-# ------------------------------------------------------------
-# Lifecycle
-# ------------------------------------------------------------
+@app.websocket("/ws/device")
+async def websocket_device(websocket: WebSocket):
+    await manager.connect_device(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            # Handle responses from device
+            if "id" in message and "response" in message:
+                manager.resolve_command(message["id"], message["response"])
+                # Also forward to frontend for live updates
+                await manager.send_to_frontend({
+                    "type": "device_response",
+                    "data": message["response"]
+                })
+            elif message.get("type") == "status":
+                # Device reports its status (ESP32 online, HMI connected, etc.)
+                await manager.send_to_frontend({
+                    "type": "status",
+                    "esp32_online": True,
+                    "hmi_connected": message.get("hmi_connected", False),
+                    "message": message.get("message", "")
+                })
+    except WebSocketDisconnect:
+        manager.disconnect_device()
+
 @app.on_event("startup")
-async def startup_event():
-    logger.info("=== HMI Gateway v4.4.0 — waiting for ESP32 ===")
+async def startup():
+    logger.info("HMI Gateway v2 started")
 
 @app.on_event("shutdown")
-async def shutdown_event():
-    if esp32_websocket:
-        await esp32_websocket.close()
-
-if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=10000,
-        log_level="info",
-    )
+async def shutdown():
+    if manager.device_ws:
+        await manager.device_ws.close()
