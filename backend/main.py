@@ -59,7 +59,7 @@ def reset_state(message="ESP32 offline"):
             future.set_result({"status": "ERROR", "error": "ESP32 disconnected"})
     pending_requests.clear()
 
-@app.websocket("/ws/esp32")
+@app.websocket("/ws_esp32")
 async def esp32_ws(websocket: WebSocket):
     global esp32_websocket, connection_status
 
