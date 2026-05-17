@@ -1,7 +1,17 @@
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 import json
 
 app = FastAPI()
+
+# Allow all origins for WebSocket and HTTP
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 latest_cmd  = {"cmd": "NONE"}
 latest_resp = {"resp": "NONE"}
@@ -18,6 +28,12 @@ async def extract_msg(request: Request) -> str:
         return data.get("msg", "")
     except Exception:
         return body.decode(errors="replace").strip()
+
+
+# ── keep-alive ping (used by UptimeRobot AND ESP32 warmup) ──
+@app.get("/ping")
+async def ping():
+    return "OK"
 
 
 @app.post("/esp32/hello")
