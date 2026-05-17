@@ -1,34 +1,54 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, Request
+import json
 
 app = FastAPI()
 
-latest_cmd = {"cmd": "NONE"}
+latest_cmd  = {"cmd": "NONE"}
 latest_resp = {"resp": "NONE"}
 
-class Msg(BaseModel):
-    msg: str
+
+async def extract_msg(request: Request) -> str:
+    """
+    Accept JSON body regardless of Content-Type header.
+    EC200U may send application/json, text/plain, or nothing.
+    """
+    body = await request.body()
+    try:
+        data = json.loads(body)
+        return data.get("msg", "")
+    except Exception:
+        return body.decode(errors="replace").strip()
+
 
 @app.post("/esp32/hello")
-async def esp32_hello(data: Msg):
-    return {"status": "OK", "received": data.msg}
+async def esp32_hello(request: Request):
+    msg = await extract_msg(request)
+    print(f"[hello] {msg}")
+    return {"status": "OK", "received": msg}
+
 
 @app.post("/esp32/sendcmd")
-async def send_command(data: Msg):
+async def send_command(request: Request):
     global latest_cmd
-    latest_cmd = {"cmd": data.msg}
+    msg = await extract_msg(request)
+    latest_cmd = {"cmd": msg}
+    print(f"[sendcmd] cmd set to: {msg}")
     return {"status": "OK"}
+
 
 @app.get("/esp32/cmd")
 async def get_cmd():
-    global latest_cmd
     return latest_cmd
 
+
 @app.post("/esp32/response")
-async def esp32_response(data: Msg):
+async def esp32_response(request: Request):
     global latest_resp
-    latest_resp = {"resp": data.msg}
+    msg = await extract_msg(request)
+    latest_resp = {"resp": msg}
+    print(f"[response] {msg}")
     return {"status": "OK"}
+
 
 @app.get("/esp32/lastresp")
 async def last_response():
